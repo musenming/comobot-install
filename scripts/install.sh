@@ -46,6 +46,9 @@ ensure_homebrew() {
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
   fi
+  # Always update brew to ensure latest formula list is available
+  info "Updating Homebrew (this may take a moment)..."
+  brew update --quiet 2>/dev/null || warn "brew update failed, continuing with existing formulas"
   success "Homebrew ready"
 }
 
@@ -71,19 +74,26 @@ ensure_python() {
       # Try newest first, fall back to older versions
       local installed=false
       for pyver in python@3.13 python@3.12 python@3.11; do
-        if brew install "$pyver" 2>/dev/null; then
-          PYTHON="$(brew --prefix "$pyver")/bin/python3"
-          # Verify it actually works
-          if "$PYTHON" --version &>/dev/null; then
+        info "Trying: brew install $pyver ..."
+        if brew install "$pyver" 2>&1 | tail -5 >&2; then
+          local py_bin
+          py_bin="$(brew --prefix "$pyver" 2>/dev/null)/bin/python3"
+          if [[ -x "$py_bin" ]] && "$py_bin" --version &>/dev/null; then
+            PYTHON="$py_bin"
             installed=true
             break
           fi
         fi
+        warn "$pyver not available, trying next..."
       done
       if ! $installed; then
         # Last resort: install unversioned python (latest)
-        brew install python
-        PYTHON="$(brew --prefix python)/bin/python3"
+        info "Trying: brew install python ..."
+        if brew install python; then
+          PYTHON="$(brew --prefix python)/bin/python3"
+        else
+          error "Cannot install Python via Homebrew. Please install Python 3.11+ manually and re-run."
+        fi
       fi
     elif command -v apt-get &>/dev/null; then
       local installed=false
