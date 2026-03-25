@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Comobot One-Click Installer for macOS / Linux
-# Usage: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/musenming/comobot/main/scripts/install.sh)"
+# Usage: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/musenming/comobot-install/main/scripts/install.sh)"
 set -euo pipefail
 
 REPO="musenming/comobot"
@@ -9,11 +9,17 @@ INSTALL_DIR_MAC="$HOME/Applications/comobot"
 DATA_DIR="$HOME/.comobot"
 PORT=18790
 
+# Global variables set by functions
+OS=""
+INSTALL_DIR=""
+PYTHON=""
+TMP_ZIP=""
+
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-info()    { echo -e "${BLUE}[comobot]${NC} $*"; }
-success() { echo -e "${GREEN}[comobot]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[comobot]${NC} $*"; }
+info()    { echo -e "${BLUE}[comobot]${NC} $*" >&2; }
+success() { echo -e "${GREEN}[comobot]${NC} $*" >&2; }
+warn()    { echo -e "${YELLOW}[comobot]${NC} $*" >&2; }
 error()   { echo -e "${RED}[comobot]${NC} $*" >&2; exit 1; }
 
 # ── OS detection ──────────────────────────────────────────────────────────────
@@ -44,13 +50,15 @@ ensure_homebrew() {
   success "Homebrew ready"
 }
 
-# ── Python 3.11 ───────────────────────────────────────────────────────────────
+# ── Python 3.11+ ─────────────────────────────────────────────────────────────
 ensure_python() {
   PYTHON=""
   for cmd in python3.12 python3.11 python3; do
     if command -v "$cmd" &>/dev/null; then
-      VER=$("$cmd" -c "import sys; print(sys.version_info[:2])")
-      if [[ "$VER" > "(3, 10)" ]]; then
+      local py_major py_minor
+      py_major=$("$cmd" -c "import sys; print(sys.version_info[0])")
+      py_minor=$("$cmd" -c "import sys; print(sys.version_info[1])")
+      if [[ "$py_major" -ge 3 && "$py_minor" -ge 11 ]]; then
         PYTHON="$cmd"
         break
       fi
@@ -78,9 +86,9 @@ ensure_python() {
 # ── Node.js 18+ ───────────────────────────────────────────────────────────────
 ensure_node() {
   if command -v node &>/dev/null; then
-    NODE_VER=$(node -e "process.exit(parseInt(process.version.slice(1)))" 2>/dev/null; echo $?)
-    NODE_MAJOR=$(node -e "console.log(parseInt(process.version.slice(1)))")
-    if [[ "$NODE_MAJOR" -ge 18 ]]; then
+    local node_major
+    node_major=$(node -e "console.log(parseInt(process.version.slice(1)))")
+    if [[ "$node_major" -ge 18 ]]; then
       success "Node.js: $(node --version)"
       return
     fi
@@ -104,31 +112,33 @@ ensure_node() {
 # ── Download latest release ───────────────────────────────────────────────────
 download_release() {
   info "Fetching latest release from GitHub..."
-  LATEST_URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep '"zipball_url"' | cut -d'"' -f4)
-  if [[ -z "$LATEST_URL" ]]; then
-    LATEST_URL="https://github.com/$REPO/archive/refs/heads/main.zip"
+  local latest_url
+  latest_url=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep '"zipball_url"' | cut -d'"' -f4) || true
+  if [[ -z "$latest_url" ]]; then
+    latest_url="https://github.com/$REPO/archive/refs/heads/main.zip"
     warn "No release found, using main branch"
   fi
 
   TMP_ZIP=$(mktemp /tmp/comobot-XXXXXX.zip)
-  info "Downloading $LATEST_URL ..."
-  curl -fsSL -L "$LATEST_URL" -o "$TMP_ZIP"
-  echo "$TMP_ZIP"
+  info "Downloading $latest_url ..."
+  curl -fsSL -L "$latest_url" -o "$TMP_ZIP"
 }
 
 # ── Extract & setup ───────────────────────────────────────────────────────────
 install_comobot() {
-  local ZIP="$1"
-
   info "Installing to $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
-  TMP_DIR=$(mktemp -d)
-  unzip -q "$ZIP" -d "$TMP_DIR"
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  unzip -q "$TMP_ZIP" -d "$tmp_dir"
+
   # Move extracted contents (GitHub adds a prefix dir)
-  EXTRACTED=$(ls "$TMP_DIR" | head -1)
-  cp -r "$TMP_DIR/$EXTRACTED/." "$INSTALL_DIR/"
-  rm -rf "$TMP_DIR" "$ZIP"
+  local extracted
+  extracted=$(ls "$tmp_dir" | head -1)
+  cp -r "$tmp_dir/$extracted/." "$INSTALL_DIR/"
+  rm -rf "$tmp_dir" "$TMP_ZIP"
 
   # Create venv
   info "Creating Python virtual environment..."
@@ -260,8 +270,8 @@ main() {
   ensure_python
   ensure_node
 
-  ZIP=$(download_release)
-  install_comobot "$ZIP"
+  download_release
+  install_comobot
 
   [[ "$OS" == "macos" ]] && setup_macos_autostart
   [[ "$OS" == "linux" ]] && setup_linux_autostart
@@ -271,8 +281,8 @@ main() {
 
   echo ""
   success "Installation complete!"
-  echo -e "  ${GREEN}→${NC} Open http://localhost:$PORT to configure Comobot"
-  echo -e "  ${GREEN}→${NC} Data stored in $DATA_DIR"
+  echo -e "  ${GREEN}→${NC} Open http://localhost:$PORT to configure Comobot" >&2
+  echo -e "  ${GREEN}→${NC} Data stored in $DATA_DIR" >&2
   echo ""
 }
 
