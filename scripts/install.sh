@@ -124,7 +124,7 @@ install_comobot() {
   info "Installing to $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
   TMP_DIR=$(mktemp -d)
-  unzip -q "$TMP_ZIP" -d "$TMP_DIR"
+  unzip -q "$ZIP" -d "$TMP_DIR"
   # Move extracted contents (GitHub adds a prefix dir)
   EXTRACTED=$(ls "$TMP_DIR" | head -1)
   cp -r "$TMP_DIR/$EXTRACTED/." "$INSTALL_DIR/"
