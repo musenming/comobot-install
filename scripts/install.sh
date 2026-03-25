@@ -46,10 +46,67 @@ ensure_homebrew() {
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
   fi
-  # Always update brew to ensure latest formula list is available
+  # Update brew to ensure latest formula list
   info "Updating Homebrew (this may take a moment)..."
-  brew update --quiet 2>/dev/null || warn "brew update failed, continuing with existing formulas"
+  if ! brew update 2>&1 | tail -3 >&2; then
+    warn "brew update had issues, continuing..."
+  fi
   success "Homebrew ready"
+}
+
+# ── Install Python from python.org (macOS fallback) ──────────────────────────
+install_python_from_official() {
+  # Python.org provides universal2 pkg installers for macOS 10.9+
+  # These work on ALL macOS 12-15, Intel and Apple Silicon, no brew needed
+  local py_version="3.12.10"
+  local pkg_name="python-${py_version}-macos11.pkg"
+
+  # Try China mirror first (Huawei), fallback to python.org
+  local urls=(
+    "https://repo.huaweicloud.com/python/${py_version}/${pkg_name}"
+    "https://registry.npmmirror.com/-/binary/python/${py_version}/${pkg_name}"
+    "https://www.python.org/ftp/python/${py_version}/${pkg_name}"
+  )
+
+  local tmp_pkg
+  tmp_pkg=$(mktemp -d)/python.pkg
+  local downloaded=false
+
+  for url in "${urls[@]}"; do
+    info "Downloading Python ${py_version} from ${url%%/${pkg_name}} ..."
+    if curl -fsSL --connect-timeout 10 "$url" -o "$tmp_pkg" 2>/dev/null; then
+      downloaded=true
+      break
+    fi
+    warn "Download failed, trying next mirror..."
+  done
+
+  if ! $downloaded; then
+    rm -f "$tmp_pkg"
+    return 1
+  fi
+
+  info "Installing Python ${py_version} (may require password)..."
+  if ! sudo installer -pkg "$tmp_pkg" -target / < /dev/tty 2>/dev/null; then
+    rm -f "$tmp_pkg"
+    return 1
+  fi
+  rm -f "$tmp_pkg"
+
+  # python.org installs to /Library/Frameworks/Python.framework/Versions/3.12/bin
+  local fw_python="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+  if [[ -x "$fw_python" ]]; then
+    PYTHON="$fw_python"
+    return 0
+  fi
+
+  # Also check if it landed in PATH
+  if command -v python3.12 &>/dev/null; then
+    PYTHON="python3.12"
+    return 0
+  fi
+
+  return 1
 }
 
 # ── Python 3.11+ ─────────────────────────────────────────────────────────────
@@ -68,14 +125,20 @@ ensure_python() {
     fi
   done
 
-  if [[ -z "$PYTHON" ]]; then
-    info "No Python 3.11+ found, installing via package manager..."
-    if [[ "$OS" == "macos" ]]; then
-      # Try newest first, fall back to older versions
-      local installed=false
+  if [[ -n "$PYTHON" ]]; then
+    success "Python: $($PYTHON --version)"
+    return
+  fi
+
+  info "No Python 3.11+ found, installing..."
+
+  if [[ "$OS" == "macos" ]]; then
+    # Strategy 1: try Homebrew
+    local installed=false
+    if command -v brew &>/dev/null; then
       for pyver in python@3.13 python@3.12 python@3.11; do
         info "Trying: brew install $pyver ..."
-        if brew install "$pyver" 2>&1 | tail -5 >&2; then
+        if brew install "$pyver" 2>&1 >&2; then
           local py_bin
           py_bin="$(brew --prefix "$pyver" 2>/dev/null)/bin/python3"
           if [[ -x "$py_bin" ]] && "$py_bin" --version &>/dev/null; then
@@ -84,44 +147,50 @@ ensure_python() {
             break
           fi
         fi
-        warn "$pyver not available, trying next..."
+        warn "$pyver not available via brew, trying next..."
       done
-      if ! $installed; then
-        # Last resort: install unversioned python (latest)
-        info "Trying: brew install python ..."
-        if brew install python; then
-          PYTHON="$(brew --prefix python)/bin/python3"
-        else
-          error "Cannot install Python via Homebrew. Please install Python 3.11+ manually and re-run."
-        fi
-      fi
-    elif command -v apt-get &>/dev/null; then
-      local installed=false
-      for pyver in 3.13 3.12 3.11; do
-        if sudo apt-get update -qq && sudo apt-get install -y "python${pyver}" "python${pyver}-venv" python3-pip 2>/dev/null; then
-          PYTHON="python${pyver}"
-          installed=true
-          break
-        fi
-      done
-      if ! $installed; then
-        error "Cannot install Python 3.11+. Please install manually and re-run."
-      fi
-    elif command -v yum &>/dev/null; then
-      local installed=false
-      for pyver in 3.13 3.12 3.11; do
-        if sudo yum install -y "python${pyver}" 2>/dev/null; then
-          PYTHON="python${pyver}"
-          installed=true
-          break
-        fi
-      done
-      if ! $installed; then
-        error "Cannot install Python 3.11+. Please install manually and re-run."
-      fi
-    else
-      error "Cannot auto-install Python. Please install Python 3.11+ and re-run."
     fi
+
+    # Strategy 2: python.org official installer (works on ALL macOS)
+    if ! $installed; then
+      warn "Homebrew cannot install Python, trying python.org installer..."
+      if install_python_from_official; then
+        installed=true
+      fi
+    fi
+
+    if ! $installed; then
+      error "Cannot install Python 3.11+. Please install from https://www.python.org/downloads/ and re-run."
+    fi
+
+  elif command -v apt-get &>/dev/null; then
+    local installed=false
+    for pyver in 3.13 3.12 3.11; do
+      if sudo apt-get update -qq && sudo apt-get install -y "python${pyver}" "python${pyver}-venv" python3-pip 2>/dev/null; then
+        PYTHON="python${pyver}"
+        installed=true
+        break
+      fi
+    done
+    if ! $installed; then
+      error "Cannot install Python 3.11+. Please install manually and re-run."
+    fi
+
+  elif command -v yum &>/dev/null; then
+    local installed=false
+    for pyver in 3.13 3.12 3.11; do
+      if sudo yum install -y "python${pyver}" 2>/dev/null; then
+        PYTHON="python${pyver}"
+        installed=true
+        break
+      fi
+    done
+    if ! $installed; then
+      error "Cannot install Python 3.11+. Please install manually and re-run."
+    fi
+
+  else
+    error "Cannot auto-install Python. Please install Python 3.11+ and re-run."
   fi
 
   # Final verification
@@ -143,7 +212,6 @@ ensure_node() {
   fi
   info "Installing Node.js..."
   if [[ "$OS" == "macos" ]]; then
-    # Install latest LTS node (brew keeps it current)
     brew install node
   elif command -v apt-get &>/dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
