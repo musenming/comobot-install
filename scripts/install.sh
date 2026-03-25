@@ -27,9 +27,9 @@ detect_os() {
   if [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macos"
     INSTALL_DIR="$INSTALL_DIR_MAC"
-    # Require macOS 12+
-    MACOS_VER=$(sw_vers -productVersion | cut -d. -f1)
-    [[ "$MACOS_VER" -ge 12 ]] || error "Comobot requires macOS 12 (Monterey) or later. Current: $(sw_vers -productVersion)"
+    local macos_ver
+    macos_ver=$(sw_vers -productVersion | cut -d. -f1)
+    [[ "$macos_ver" -ge 12 ]] || error "Comobot requires macOS 12 (Monterey) or later. Current: $(sw_vers -productVersion)"
   elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
     INSTALL_DIR="$INSTALL_DIR_LINUX"
@@ -44,7 +44,6 @@ ensure_homebrew() {
   if ! command -v brew &>/dev/null; then
     info "Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for the rest of this script
     eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
   fi
   success "Homebrew ready"
@@ -53,11 +52,12 @@ ensure_homebrew() {
 # ── Python 3.11+ ─────────────────────────────────────────────────────────────
 ensure_python() {
   PYTHON=""
-  for cmd in python3.12 python3.11 python3; do
+  # Search for existing Python 3.11+ (newest first)
+  for cmd in python3.13 python3.12 python3.11 python3; do
     if command -v "$cmd" &>/dev/null; then
       local py_major py_minor
-      py_major=$("$cmd" -c "import sys; print(sys.version_info[0])")
-      py_minor=$("$cmd" -c "import sys; print(sys.version_info[1])")
+      py_major=$("$cmd" -c "import sys; print(sys.version_info[0])") || continue
+      py_minor=$("$cmd" -c "import sys; print(sys.version_info[1])") || continue
       if [[ "$py_major" -ge 3 && "$py_minor" -ge 11 ]]; then
         PYTHON="$cmd"
         break
@@ -66,19 +66,57 @@ ensure_python() {
   done
 
   if [[ -z "$PYTHON" ]]; then
-    info "Installing Python 3.11..."
+    info "No Python 3.11+ found, installing via package manager..."
     if [[ "$OS" == "macos" ]]; then
-      brew install python@3.11
-      PYTHON="$(brew --prefix python@3.11)/bin/python3.11"
+      # Try newest first, fall back to older versions
+      local installed=false
+      for pyver in python@3.13 python@3.12 python@3.11; do
+        if brew install "$pyver" 2>/dev/null; then
+          PYTHON="$(brew --prefix "$pyver")/bin/python3"
+          # Verify it actually works
+          if "$PYTHON" --version &>/dev/null; then
+            installed=true
+            break
+          fi
+        fi
+      done
+      if ! $installed; then
+        # Last resort: install unversioned python (latest)
+        brew install python
+        PYTHON="$(brew --prefix python)/bin/python3"
+      fi
     elif command -v apt-get &>/dev/null; then
-      sudo apt-get update -qq && sudo apt-get install -y python3.11 python3.11-venv python3-pip
-      PYTHON="python3.11"
+      local installed=false
+      for pyver in 3.13 3.12 3.11; do
+        if sudo apt-get update -qq && sudo apt-get install -y "python${pyver}" "python${pyver}-venv" python3-pip 2>/dev/null; then
+          PYTHON="python${pyver}"
+          installed=true
+          break
+        fi
+      done
+      if ! $installed; then
+        error "Cannot install Python 3.11+. Please install manually and re-run."
+      fi
     elif command -v yum &>/dev/null; then
-      sudo yum install -y python3.11
-      PYTHON="python3.11"
+      local installed=false
+      for pyver in 3.13 3.12 3.11; do
+        if sudo yum install -y "python${pyver}" 2>/dev/null; then
+          PYTHON="python${pyver}"
+          installed=true
+          break
+        fi
+      done
+      if ! $installed; then
+        error "Cannot install Python 3.11+. Please install manually and re-run."
+      fi
     else
       error "Cannot auto-install Python. Please install Python 3.11+ and re-run."
     fi
+  fi
+
+  # Final verification
+  if ! "$PYTHON" --version &>/dev/null; then
+    error "Python installation failed. Please install Python 3.11+ manually."
   fi
   success "Python: $($PYTHON --version)"
 }
@@ -93,15 +131,15 @@ ensure_node() {
       return
     fi
   fi
-  info "Installing Node.js 18 LTS..."
+  info "Installing Node.js..."
   if [[ "$OS" == "macos" ]]; then
-    brew install node@18
-    export PATH="$(brew --prefix node@18)/bin:$PATH"
+    # Install latest LTS node (brew keeps it current)
+    brew install node
   elif command -v apt-get &>/dev/null; then
-    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
     sudo apt-get install -y nodejs
   elif command -v yum &>/dev/null; then
-    curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
+    curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
     sudo yum install -y nodejs
   else
     error "Cannot auto-install Node.js. Please install Node.js 18+ and re-run."
@@ -112,17 +150,28 @@ ensure_node() {
 # ── Download latest release ───────────────────────────────────────────────────
 download_release() {
   info "Fetching latest release from GitHub..."
-  local latest_url
-  latest_url=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep '"zipball_url"' | cut -d'"' -f4) || true
+
+  local latest_url=""
+  local curl_opts=(-fsSL)
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl_opts+=(-H "Authorization: token $GITHUB_TOKEN")
+  fi
+
+  latest_url=$(curl "${curl_opts[@]}" "https://api.github.com/repos/$REPO/releases/latest" \
+    2>/dev/null | grep '"zipball_url"' | cut -d'"' -f4) || true
+
   if [[ -z "$latest_url" ]]; then
     latest_url="https://github.com/$REPO/archive/refs/heads/main.zip"
     warn "No release found, using main branch"
   fi
 
-  TMP_ZIP=$(mktemp /tmp/comobot-XXXXXX.zip)
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  TMP_ZIP="$tmp_dir/comobot.zip"
+
   info "Downloading $latest_url ..."
-  curl -fsSL -L "$latest_url" -o "$TMP_ZIP"
+  curl -fsSL -L "$latest_url" -o "$TMP_ZIP" \
+    || error "Download failed. Check your network connection."
 }
 
 # ── Extract & setup ───────────────────────────────────────────────────────────
@@ -161,10 +210,10 @@ install_comobot() {
 
 # ── macOS LaunchAgent (autostart) ─────────────────────────────────────────────
 setup_macos_autostart() {
-  PLIST_DIR="$HOME/Library/LaunchAgents"
-  PLIST="$PLIST_DIR/ai.comobot.gateway.plist"
-  mkdir -p "$PLIST_DIR"
-  cat > "$PLIST" <<EOF
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist="$plist_dir/ai.comobot.gateway.plist"
+  mkdir -p "$plist_dir"
+  cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -188,16 +237,16 @@ setup_macos_autostart() {
 </dict>
 </plist>
 EOF
-  launchctl load "$PLIST" 2>/dev/null || true
+  launchctl load "$plist" 2>/dev/null || true
   success "macOS autostart configured"
 }
 
 # ── Linux systemd (optional) ──────────────────────────────────────────────────
 setup_linux_autostart() {
   if ! command -v systemctl &>/dev/null; then return; fi
-  SERVICE="$HOME/.config/systemd/user/comobot.service"
-  mkdir -p "$(dirname "$SERVICE")"
-  cat > "$SERVICE" <<EOF
+  local service="$HOME/.config/systemd/user/comobot.service"
+  mkdir -p "$(dirname "$service")"
+  cat > "$service" <<EOF
 [Unit]
 Description=Comobot Gateway
 After=network.target
@@ -220,13 +269,13 @@ EOF
 # ── Desktop shortcut ──────────────────────────────────────────────────────────
 create_shortcut() {
   if [[ "$OS" == "macos" ]]; then
-    SHORTCUT="$HOME/Desktop/Comobot.command"
-    cat > "$SHORTCUT" <<EOF
+    local shortcut="$HOME/Desktop/Comobot.command"
+    cat > "$shortcut" <<EOF
 #!/bin/bash
 open http://localhost:$PORT
 EOF
-    chmod +x "$SHORTCUT"
-    success "Desktop shortcut: $SHORTCUT"
+    chmod +x "$shortcut"
+    success "Desktop shortcut: $shortcut"
   fi
 }
 
@@ -245,15 +294,15 @@ start_service() {
 
 # ── Open browser ──────────────────────────────────────────────────────────────
 open_browser() {
-  URL="http://localhost:$PORT"
-  info "Opening $URL ..."
+  local url="http://localhost:$PORT"
+  info "Opening $url ..."
   sleep 1
   if [[ "$OS" == "macos" ]]; then
-    open "$URL"
+    open "$url"
   elif command -v xdg-open &>/dev/null; then
-    xdg-open "$URL"
+    xdg-open "$url"
   else
-    info "Please open $URL in your browser"
+    info "Please open $url in your browser"
   fi
 }
 
@@ -266,24 +315,32 @@ main() {
   echo ""
 
   detect_os
-  [[ "$OS" == "macos" ]] && ensure_homebrew
+
+  if [[ "$OS" == "macos" ]]; then
+    ensure_homebrew
+  fi
+
   ensure_python
   ensure_node
 
   download_release
   install_comobot
 
-  [[ "$OS" == "macos" ]] && setup_macos_autostart
-  [[ "$OS" == "linux" ]] && setup_linux_autostart
+  if [[ "$OS" == "macos" ]]; then
+    setup_macos_autostart
+  elif [[ "$OS" == "linux" ]]; then
+    setup_linux_autostart
+  fi
+
   create_shortcut
   start_service
   open_browser
 
-  echo ""
+  echo "" >&2
   success "Installation complete!"
   echo -e "  ${GREEN}→${NC} Open http://localhost:$PORT to configure Comobot" >&2
   echo -e "  ${GREEN}→${NC} Data stored in $DATA_DIR" >&2
-  echo ""
+  echo "" >&2
 }
 
 main "$@"
